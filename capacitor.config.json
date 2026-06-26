@@ -1,0 +1,8 @@
+{
+  "appId": "com.eugen.micerebroia",
+  "appName": "Mi Cerebro IA",
+  "webDir": "dist",
+  "server": {
+    "androidScheme": "http"
+  }
+}
