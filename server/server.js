@@ -4,7 +4,6 @@ import multer from "multer";
 import OpenAI from "openai";
 import dotenv from "dotenv";
 import fs from "fs";
-import path from "path";
 import ffmpeg from "fluent-ffmpeg";
 import ffmpegStatic from "ffmpeg-static";
 
@@ -20,6 +19,7 @@ const openai = new OpenAI({
 });
 
 app.use(cors());
+app.use(express.json({ limit: "10mb" }));
 
 app.get("/", (req, res) => {
   res.send("Servidor Mi Cerebro IA funcionando");
@@ -33,6 +33,98 @@ function convertToMp3(inputPath, outputPath) {
       .on("error", reject)
       .save(outputPath);
   });
+}
+
+function cleanJsonText(rawText = "") {
+  return rawText.replace(/```json|```/g, "").trim();
+}
+
+function safeArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function limitText(text = "", maxLength = 12000) {
+  if (typeof text !== "string") return "";
+  return text.length > maxLength ? text.slice(0, maxLength) : text;
+}
+
+function getNoteText(note) {
+  return (
+    note?.text ||
+    note?.transcription ||
+    note?.transcript ||
+    note?.content ||
+    note?.analysis?.summary ||
+    ""
+  );
+}
+
+function getNoteProject(note) {
+  return (
+    note?.analysis?.project ||
+    note?.analysis?.proyecto ||
+    note?.project ||
+    "Sin proyecto"
+  );
+}
+
+function formatNotesForContext(notes = [], maxNotes = 30) {
+  return safeArray(notes)
+    .slice(0, maxNotes)
+    .map((note, index) => {
+      const text = getNoteText(note);
+      const project = getNoteProject(note);
+      const date = note?.createdAt || note?.date || "Sin fecha";
+
+      return `${index + 1}. Fecha: ${date}
+Proyecto: ${project}
+Idea: ${text}`;
+    })
+    .join("\n\n");
+}
+
+function formatRemindersForContext(reminders = [], maxReminders = 20) {
+  return safeArray(reminders)
+    .slice(0, maxReminders)
+    .map((reminder, index) => {
+      return `${index + 1}. ${reminder?.title || reminder?.text || "Recordatorio"}
+Fecha: ${reminder?.dateTime || "Sin fecha"}
+Descripción: ${reminder?.description || ""}`;
+    })
+    .join("\n\n");
+}
+
+function formatProjectsForContext(memory = {}) {
+  const projects = memory?.projects || {};
+
+  if (!projects || typeof projects !== "object") {
+    return "";
+  }
+
+  return Object.entries(projects)
+    .map(([projectName, projectData]) => {
+      const summaries = safeArray(projectData?.summaries)
+        .slice(0, 5)
+        .join(" | ");
+
+      return `Proyecto: ${projectName}
+Ideas registradas: ${projectData?.notesCount || 0}
+Resumen: ${summaries || "Sin resumen todavía"}`;
+    })
+    .join("\n\n");
+}
+
+function formatConceptsForContext(memory = {}) {
+  const concepts = memory?.concepts || {};
+
+  if (!concepts || typeof concepts !== "object") {
+    return "";
+  }
+
+  return Object.entries(concepts)
+    .slice(0, 20)
+    .map(([conceptName, count]) => `${conceptName}: ${count} menciones`)
+    .join("\n");
 }
 
 app.post("/transcribe", upload.single("audio"), async (req, res) => {
@@ -85,7 +177,6 @@ app.post("/transcribe", upload.single("audio"), async (req, res) => {
     });
   }
 });
-app.use(express.json({ limit: "10mb" }));
 
 app.post("/analyze", async (req, res) => {
   try {
@@ -98,9 +189,9 @@ app.post("/analyze", async (req, res) => {
       });
     }
 
-    const context = previousNotes
+    const context = safeArray(previousNotes)
       .slice(0, 20)
-      .map((note, index) => `${index + 1}. ${note.text}`)
+      .map((note, index) => `${index + 1}. ${getNoteText(note)}`)
       .join("\n");
 
     const response = await openai.responses.create({
@@ -134,7 +225,7 @@ Devuelve una respuesta clara en JSON válido con esta estructura:
     });
 
     const rawText = response.output_text;
-    const cleanText = rawText.replace(/```json|```/g, "").trim();
+    const cleanText = cleanJsonText(rawText);
     const analysis = JSON.parse(cleanText);
 
     res.json({
@@ -150,6 +241,7 @@ Devuelve una respuesta clara en JSON válido con esta estructura:
     });
   }
 });
+
 app.post("/parse-reminder", async (req, res) => {
   try {
     const { text } = req.body;
@@ -184,7 +276,7 @@ Si no hay aviso previo especificado, usa 5 minutos.
     });
 
     const rawText = response.output_text;
-    const cleanText = rawText.replace(/```json|```/g, "").trim();
+    const cleanText = cleanJsonText(rawText);
     const reminder = JSON.parse(cleanText);
 
     res.json({
@@ -193,6 +285,116 @@ Si no hay aviso previo especificado, usa 5 minutos.
     });
   } catch (error) {
     console.error("ERROR RECORDATORIO:", error);
+
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+app.post("/ask-memory", async (req, res) => {
+  try {
+    const { question, context = {} } = req.body;
+
+    if (!question || !question.trim()) {
+      return res.status(400).json({
+        success: false,
+        error: "No llegó ninguna pregunta para responder",
+      });
+    }
+
+    const calibrationText = context?.calibration?.text || "";
+    const recentNotesText = formatNotesForContext(
+      context?.recentNotes || context?.notes || [],
+      30
+    );
+    const remindersText = formatRemindersForContext(context?.reminders || [], 20);
+    const projectsText = formatProjectsForContext(context?.memory || {});
+    const conceptsText = formatConceptsForContext(context?.memory || {});
+
+    const memoryContext = limitText(
+      `
+CALIBRANDO / MEMORIA ACUMULADA:
+${calibrationText || "Todavía no hay Calibrando creado."}
+
+MEMORIA POR PROYECTOS:
+${projectsText || "Todavía no hay memoria por proyectos."}
+
+CONCEPTOS FRECUENTES:
+${conceptsText || "Todavía no hay conceptos frecuentes."}
+
+ÚLTIMAS IDEAS:
+${recentNotesText || "Todavía no hay ideas recientes."}
+
+RECORDATORIOS:
+${remindersText || "No hay recordatorios relevantes."}
+`,
+      15000
+    );
+
+    const response = await openai.responses.create({
+      model: "gpt-4o-mini",
+      input: `
+Eres "Mi Cerebro IA", un agente personal de pensamiento estratégico para Eugen.
+
+No eres un asistente genérico.
+Respondes usando la memoria de Eugen, sus proyectos, sus ideas, sus decisiones y sus patrones.
+
+Proyectos conocidos:
+- Oë: gafas de madera artesanales.
+- 33 Raw Elements: línea premium de gafas de ébano, ébano, territorio, estética sobria, volcánica, artesanal y premium.
+- La Ruta Artesana: app/red para conectar artesanos, territorio y personas.
+- Escuela de Oficios: formación artesanal con salida laboral.
+- Mi Cerebro IA: segundo cerebro personal, notas, memoria, agenda, recordatorios y agente con IA.
+
+Memoria disponible:
+${memoryContext}
+
+Pregunta de Eugen:
+${question}
+
+Responde en español, de forma clara, directa y útil.
+
+Si la pregunta pide conclusiones o estrategia, usa este formato:
+
+Conclusión
+
+Lo que veo:
+...
+
+Prioridad:
+...
+
+Riesgo:
+...
+
+Oportunidad:
+...
+
+Qué haría ahora:
+1. ...
+2. ...
+3. ...
+
+Reglas:
+- No inventes datos que no estén en la memoria.
+- Puedes razonar y sacar conclusiones, pero deja claro cuando sea una interpretación.
+- Sé concreto.
+- No escribas demasiado.
+- Prioriza acciones útiles.
+- Si falta información, dilo y propone qué tendría que registrar Eugen para mejorar la respuesta.
+`,
+    });
+
+    const answer = response.output_text?.trim() || "No pude generar una respuesta.";
+
+    res.json({
+      success: true,
+      answer,
+    });
+  } catch (error) {
+    console.error("ERROR ASK MEMORY:", error);
 
     res.status(500).json({
       success: false,

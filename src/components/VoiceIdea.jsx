@@ -1,6 +1,11 @@
 import { useState } from "react";
 import { VoiceRecorder } from "capacitor-voice-recorder";
-import { analyzeTextIdea, transcribeAudioFile } from "../services/api";
+import {
+  analyzeTextIdea,
+  parseReminderText,
+  transcribeAudioFile,
+} from "../services/api.js";
+import { createNote, loadData, saveData } from "../services/storage.js";
 
 function base64ToFile(base64, mimeType) {
   const byteCharacters = atob(base64);
@@ -22,7 +27,40 @@ function base64ToFile(base64, mimeType) {
   });
 }
 
-function VoiceIdea({ data, onSaveNote, setScreen }) {
+function looksLikeReminder(text = "") {
+  const lower = text.toLowerCase();
+
+  return [
+    "recuérdame",
+    "recordarme",
+    "tengo que",
+    "debo",
+    "mañana",
+    "pasado mañana",
+    "lunes",
+    "martes",
+    "miércoles",
+    "miercoles",
+    "jueves",
+    "viernes",
+    "sábado",
+    "sabado",
+    "domingo",
+    "a las",
+    "el día",
+    "el dia",
+    "próximo",
+    "proximo",
+  ].some((word) => lower.includes(word));
+}
+
+function VoiceIdea({
+  data,
+  setData,
+  onSaveNote,
+  onSaveReminder,
+  setScreen,
+}) {
   const [ideaText, setIdeaText] = useState("");
   const [isRecording, setIsRecording] = useState(false);
   const [audioUrl, setAudioUrl] = useState(null);
@@ -31,6 +69,8 @@ function VoiceIdea({ data, onSaveNote, setScreen }) {
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [analysis, setAnalysis] = useState(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [detectedReminder, setDetectedReminder] = useState(null);
+  const [isDetectingReminder, setIsDetectingReminder] = useState(false);
 
   async function startRecording() {
     try {
@@ -52,6 +92,7 @@ function VoiceIdea({ data, onSaveNote, setScreen }) {
       setAudioData(null);
       setAudioMimeType(null);
       setAnalysis(null);
+      setDetectedReminder(null);
 
       await VoiceRecorder.startRecording();
       setIsRecording(true);
@@ -83,6 +124,24 @@ function VoiceIdea({ data, onSaveNote, setScreen }) {
     setAudioUrl(null);
     setAudioData(null);
     setAudioMimeType(null);
+    setDetectedReminder(null);
+  }
+
+  async function detectReminderFromText(text) {
+    if (!looksLikeReminder(text)) return;
+
+    try {
+      setIsDetectingReminder(true);
+      const reminder = await parseReminderText(text);
+
+      if (reminder?.dateTime && reminder?.title) {
+        setDetectedReminder(reminder);
+      }
+    } catch (error) {
+      console.warn("No se detectó recordatorio:", error);
+    } finally {
+      setIsDetectingReminder(false);
+    }
   }
 
   async function transcribeAudio() {
@@ -99,6 +158,9 @@ function VoiceIdea({ data, onSaveNote, setScreen }) {
 
       setIdeaText(text);
       setAnalysis(null);
+      setDetectedReminder(null);
+
+      await detectReminderFromText(text);
     } catch (error) {
       alert("No se pudo transcribir el audio: " + error.message);
       console.error(error);
@@ -115,7 +177,15 @@ function VoiceIdea({ data, onSaveNote, setScreen }) {
 
     try {
       setIsAnalyzing(true);
-      const result = await analyzeTextIdea(ideaText, data.notes);
+
+      const currentData = loadData();
+      const previousNotes = Array.isArray(currentData?.notes)
+        ? currentData.notes
+        : Array.isArray(data?.notes)
+        ? data.notes
+        : [];
+
+      const result = await analyzeTextIdea(ideaText, previousNotes);
       setAnalysis(result);
     } catch (error) {
       alert("No se pudo analizar la idea: " + error.message);
@@ -125,17 +195,71 @@ function VoiceIdea({ data, onSaveNote, setScreen }) {
     }
   }
 
-  function saveIdea() {
-    if (!ideaText.trim() && !audioData) return;
+  function resetForm() {
+    setIdeaText("");
+    setAudioUrl(null);
+    setAudioData(null);
+    setAudioMimeType(null);
+    setAnalysis(null);
+    setDetectedReminder(null);
+  }
 
-    onSaveNote({
-      text: ideaText,
-      audioData,
-      audioMimeType,
-      analysis,
+  function saveIdea() {
+    if (!ideaText.trim() && !audioData) {
+      alert("No hay ninguna idea para guardar.");
+      return;
+    }
+
+    try {
+      const newNote = createNote({
+        text: ideaText,
+        audioData,
+        audioMimeType,
+        analysis,
+      });
+
+      const currentData = loadData();
+
+      const currentNotes = Array.isArray(currentData?.notes)
+        ? currentData.notes
+        : [];
+
+      const updatedData = {
+        ...currentData,
+        notes: [newNote, ...currentNotes],
+      };
+
+      saveData(updatedData);
+
+      if (typeof setData === "function") {
+        setData(updatedData);
+      } else if (typeof onSaveNote === "function") {
+        onSaveNote({
+          text: ideaText,
+          audioData,
+          audioMimeType,
+          analysis,
+        });
+      }
+
+      resetForm();
+      setScreen("home");
+    } catch (error) {
+      console.error("Error guardando idea:", error);
+      alert("No se pudo guardar la idea.");
+    }
+  }
+
+  function saveDetectedReminder() {
+    if (!detectedReminder) return;
+
+    onSaveReminder({
+      originalText: ideaText,
+      parsedReminder: detectedReminder,
     });
 
-    setScreen("home");
+    alert("Recordatorio guardado.");
+    setDetectedReminder(null);
   }
 
   return (
@@ -181,8 +305,43 @@ function VoiceIdea({ data, onSaveNote, setScreen }) {
           onChange={(event) => {
             setIdeaText(event.target.value);
             setAnalysis(null);
+            setDetectedReminder(null);
           }}
         />
+
+        {isDetectingReminder && (
+          <div className="card">
+            <p>Buscando si esto también es un recordatorio...</p>
+          </div>
+        )}
+
+        {detectedReminder && (
+          <div className="card">
+            <h3>📅 Recordatorio detectado</h3>
+
+            <p>
+              <strong>Título:</strong> {detectedReminder.title}
+            </p>
+
+            <p>
+              <strong>Descripción:</strong> {detectedReminder.description}
+            </p>
+
+            <p>
+              <strong>Fecha:</strong>{" "}
+              {new Date(detectedReminder.dateTime).toLocaleString()}
+            </p>
+
+            <p>
+              <strong>Aviso previo:</strong>{" "}
+              {detectedReminder.notifyMinutesBefore || 5} minutos
+            </p>
+
+            <button className="action primary" onClick={saveDetectedReminder}>
+              Guardar como recordatorio
+            </button>
+          </div>
+        )}
 
         <button className="action" onClick={analyzeIdea}>
           {isAnalyzing ? "Analizando..." : "Analizar idea"}

@@ -40,30 +40,33 @@ function App() {
 
   if (screen === "hablar") {
     return (
-      <VoiceIdea
-        data={data}
-        onSaveNote={handleSaveNote}
-        setScreen={setScreen}
-      />
+    <VoiceIdea
+  data={data}
+  setData={setData}
+  onSaveNote={handleSaveNote}
+  onSaveReminder={handleSaveReminder}
+  setScreen={setScreen}
+/>
     );
   }
 
   if (screen === "recordatorio") {
     return (
-      <ReminderScreen
-        data={data}
-        onSaveReminder={handleSaveReminder}
-        setScreen={setScreen}
-      />
+     <ReminderScreen
+  data={data}
+  setData={setData}
+  onSaveReminder={handleSaveReminder}
+  setScreen={setScreen}
+/>
     );
   }
 
   if (screen === "ideas") {
-    return <IdeasScreen data={data} setScreen={setScreen} />;
+    return <IdeasScreen data={data} setData={setData} setScreen={setScreen} />;
   }
 
   if (screen === "resumen") {
-    return <SummaryScreen data={data} setScreen={setScreen} />;
+    return <SummaryScreen data={data} setData={setData} setScreen={setScreen} />;
   }
 
   return <Home data={data} setScreen={setScreen} />;
