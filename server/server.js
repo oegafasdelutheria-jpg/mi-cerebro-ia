@@ -18,6 +18,8 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
+const AGENT_MODEL = process.env.AGENT_MODEL || "gpt-5.6-terra";
+
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
@@ -244,7 +246,7 @@ Devuelve una respuesta clara en JSON válido con esta estructura:
 
 app.post("/parse-reminder", async (req, res) => {
   try {
-    const { text } = req.body;
+    const { text, clientTime = {} } = req.body;
 
     if (!text || !text.trim()) {
       return res.status(400).json({
@@ -253,12 +255,14 @@ app.post("/parse-reminder", async (req, res) => {
       });
     }
 
-    const now = new Date();
+    const localNow = clientTime?.localDateTime || new Date().toISOString();
+    const timezone = clientTime?.timezone || "local";
 
     const response = await openai.responses.create({
       model: "gpt-4o-mini",
       input: `
-Hoy es: ${now.toISOString()}.
+Fecha y hora local del usuario: ${localNow}.
+Zona horaria del usuario: ${timezone}.
 
 Interpreta este recordatorio en español:
 "${text}"
@@ -267,11 +271,12 @@ Devuelve SOLO JSON válido con esta estructura:
 {
   "title": "título corto del recordatorio",
   "description": "detalle del recordatorio",
-  "dateTime": "fecha y hora en formato ISO 8601",
+  "dateTime": "fecha y hora LOCAL en formato YYYY-MM-DDTHH:mm:ss, sin Z y sin offset",
   "notifyMinutesBefore": 5
 }
 
 Si no hay aviso previo especificado, usa 5 minutos.
+No conviertas la hora a UTC: conserva exactamente la hora local que pidió el usuario.
 `,
     });
 
@@ -285,6 +290,185 @@ Si no hay aviso previo especificado, usa 5 minutos.
     });
   } catch (error) {
     console.error("ERROR RECORDATORIO:", error);
+
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+function formatConversationForAgent(conversation = [], maxMessages = 16) {
+  return safeArray(conversation)
+    .slice(-maxMessages)
+    .map((message) => {
+      const role = message?.role === "assistant" ? "Mi Cerebro" : "Eugen";
+      const text = limitText(String(message?.text || ""), 2500);
+      return `${role}: ${text}`;
+    })
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+function formatRelevantNotesForAgent(notes = [], maxNotes = 26) {
+  return safeArray(notes)
+    .slice(0, maxNotes)
+    .map((note, index) => {
+      const analysis = note?.analysis || {};
+      const tags = safeArray(analysis?.tags).join(", ");
+      const nextSteps = safeArray(analysis?.nextSteps).join(" | ");
+
+      return `${index + 1}. [${note?.project || "Sin proyecto"}] ${note?.createdAt || "Sin fecha"}\n${limitText(note?.text || "", 1600)}${tags ? `\nEtiquetas: ${tags}` : ""}${nextSteps ? `\nPróximos pasos registrados: ${nextSteps}` : ""}`;
+    })
+    .join("\n\n");
+}
+
+function formatAgentProjects(projects = []) {
+  return safeArray(projects)
+    .slice(0, 30)
+    .map((project) => {
+      return `- ${project?.name || "Proyecto"}: ${safeArray(project?.summaries).slice(0, 6).join(" | ") || "sin resumen estructurado"}`;
+    })
+    .join("\n");
+}
+
+function formatAgentSummaries(summaries = []) {
+  return safeArray(summaries)
+    .slice(0, 10)
+    .map((summary) => `- ${summary?.date || "Sin fecha"}: ${limitText(summary?.text || "", 1200)}`)
+    .join("\n");
+}
+
+function parseAgentJson(rawText = "") {
+  const clean = cleanJsonText(rawText);
+
+  try {
+    return JSON.parse(clean);
+  } catch {
+    const first = clean.indexOf("{");
+    const last = clean.lastIndexOf("}");
+    if (first >= 0 && last > first) {
+      return JSON.parse(clean.slice(first, last + 1));
+    }
+    throw new Error("El agente no devolvió JSON válido.");
+  }
+}
+
+app.post("/agent", async (req, res) => {
+  try {
+    const { question, context = {}, conversation = [] } = req.body;
+
+    if (!question || !question.trim()) {
+      return res.status(400).json({
+        success: false,
+        error: "No llegó ninguna pregunta para el agente",
+      });
+    }
+
+    const clientTime = context?.clientTime || {};
+    const localDateTime = clientTime?.localDateTime || new Date().toISOString();
+    const timezone = clientTime?.timezone || "local";
+
+    const memoryContext = limitText(
+      `
+MEMORIA ACUMULADA / CALIBRANDO:
+${context?.calibration?.text || "Sin Calibrando todavía."}
+
+PROYECTOS:
+${formatAgentProjects(context?.projects || []) || "Sin proyectos estructurados."}
+
+IDEAS MÁS RELEVANTES PARA ESTA PREGUNTA:
+${formatRelevantNotesForAgent(context?.relevantNotes || []) || "Sin notas relevantes."}
+
+RECORDATORIOS Y AGENDA RELEVANTE:
+${formatRemindersForContext(context?.reminders || [], 24) || "Sin recordatorios relevantes."}
+
+RESÚMENES RECIENTES:
+${formatAgentSummaries(context?.dailySummaries || []) || "Sin resúmenes recientes."}
+`,
+      30000
+    );
+
+    const conversationText = formatConversationForAgent(conversation, 16);
+
+    const response = await openai.responses.create({
+      model: AGENT_MODEL,
+      input: `
+Eres "Mi Cerebro", el agente personal de Eugen.
+
+Tu objetivo no es producir informes por defecto. Tu objetivo es conversar con naturalidad, continuidad y criterio, como un colaborador que conoce su trabajo y su memoria.
+
+FECHA/HORA LOCAL ACTUAL:
+${localDateTime} (${timezone})
+
+MEMORIA DISPONIBLE:
+${memoryContext}
+
+CONVERSACIÓN RECIENTE:
+${conversationText || "Esta es la primera intervención de la conversación."}
+
+NUEVO MENSAJE DE EUGEN:
+${question}
+
+COMPORTAMIENTO:
+- Responde primero a lo que Eugen realmente pregunta. No uses una plantilla fija.
+- Sé claro, eficiente y humano. Por defecto, responde con la longitud necesaria y no más.
+- Usa la memoria cuando sea relevante. Si un dato no aparece en la memoria, no lo inventes.
+- Distingue hechos registrados de tus interpretaciones.
+- Mantén continuidad con la conversación reciente; entiende referencias como "eso", "lo anterior", "hazlo" o "el martes" usando el contexto disponible.
+- Si Eugen pregunta por agenda, fechas o recordatorios, da prioridad al calendario sobre resúmenes generales.
+- Si pide que recuerdes o guardes una idea/decisión, puedes proponer una acción save_note.
+- Si pide crear un recordatorio, una alerta o "recuérdame...", prepara una acción create_reminder.
+- No ejecutes acciones destructivas. Solo prepara acciones que la app mostrará para confirmación.
+- Para create_reminder, dateTime debe ser hora LOCAL en formato YYYY-MM-DDTHH:mm:ss, sin Z ni offset.
+
+Devuelve SOLO JSON válido con este formato:
+{
+  "answer": "respuesta conversacional",
+  "action": null
+}
+
+O, cuando corresponda crear un recordatorio:
+{
+  "answer": "respuesta breve explicando lo que has preparado",
+  "action": {
+    "type": "create_reminder",
+    "originalText": "texto breve de origen",
+    "reminder": {
+      "title": "título corto",
+      "description": "detalle útil y breve",
+      "dateTime": "YYYY-MM-DDTHH:mm:ss",
+      "notifyMinutesBefore": 5
+    }
+  }
+}
+
+O, cuando corresponda guardar una idea/decisión en memoria:
+{
+  "answer": "respuesta breve",
+  "action": {
+    "type": "save_note",
+    "note": {
+      "text": "contenido que debe recordarse",
+      "summary": "resumen breve",
+      "project": "proyecto si se conoce, o Sin proyecto",
+      "tags": ["etiqueta1", "etiqueta2"]
+    }
+  }
+}
+`,
+    });
+
+    const parsed = parseAgentJson(response.output_text || "");
+
+    res.json({
+      success: true,
+      answer: String(parsed?.answer || "No pude generar una respuesta.").trim(),
+      action: parsed?.action && typeof parsed.action === "object" ? parsed.action : null,
+      model: AGENT_MODEL,
+    });
+  } catch (error) {
+    console.error("ERROR AGENT:", error);
 
     res.status(500).json({
       success: false,
